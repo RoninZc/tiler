@@ -71,7 +71,6 @@ type Task struct {
 	tileWG       sync.WaitGroup
 	abort        chan struct{}
 	workers      chan struct{}
-	tileSet      Set
 }
 
 // NewTask 创建下载任务
@@ -106,7 +105,6 @@ func NewTask(layers []Layer, m TileMap) *Task {
 
 	task.abort = make(chan struct{})
 	task.workers = make(chan struct{}, task.workerCount)
-	task.tileSet = Set{M: make(maptile.Set)}
 
 	return &task
 }
@@ -167,21 +165,21 @@ func (task *Task) tileFetcher(mt maptile.Tile) {
 	url := task.TileMap.GetTileURL(mt)
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Errorf("fetch :%s error, details: %s ~", url, err)
+		log.Debugf("fetch :%s error, details: %s ~", url, err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Errorf("fetch %v tile error, status code: %d ~", url, resp.StatusCode)
+		log.Debugf("fetch %v tile error, status code: %d ~", url, resp.StatusCode)
 		return
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Errorf("read %v tile error ~ %s", mt, err)
+		log.Debugf("read %v tile error ~ %s", mt, err)
 		return
 	}
 	if len(body) == 0 {
-		log.Warnf("nil tile %v ~", mt)
+		log.Debugf("nil tile %v ~", mt)
 		return //zero byte tiles n
 	}
 	// tiledata
@@ -233,10 +231,6 @@ func (task *Task) downloadLayer(layer Layer) {
 	go tilecover.CollectionChannel(layer.Collection, maptile.Zoom(layer.Zoom), tilelist)
 
 	for tile := range tilelist {
-		// 任务从设置的开始点启动
-		if task.checkStart() {
-			continue
-		}
 		select {
 		// 向队列发送数据
 		case task.workers <- struct{}{}:
@@ -252,16 +246,10 @@ func (task *Task) downloadLayer(layer Layer) {
 			go task.tileFetcher(tile)
 		case <-task.abort:
 			log.Infof("Task %s got canceled.", task.Name)
-		default:
-			log.Debugln("wait works...")
 		}
 	}
 	//等待该层结束
 	task.tileWG.Wait()
 	bar.FinishPrint(fmt.Sprintf("Task %s Zoom %d finished ~", task.ID, layer.Zoom))
 
-}
-
-func (task *Task) checkStart() bool {
-	return false
 }

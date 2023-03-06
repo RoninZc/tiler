@@ -35,6 +35,6 @@ format = "png"
 url = "https://gac-geo.googlecnapps.cn/maps/vt?lyrs=s&x={x}&y={y}&z={z}"
 
 [[lrs]]
-geojson = "./geojson/china.geojson"
-max = 18
+geojson = "./geojson/china-new.geojson"
+max = 17
 min = 17
