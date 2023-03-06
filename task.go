@@ -238,12 +238,14 @@ func (task *Task) downloadLayer(layer Layer) {
 			// 如果已经在成功列表里
 			if BreakPointInst.IsSuccessed(tile) {
 				log.Infoln("芜湖，该文件已下载，跳过")
+				<-task.workers
 				continue
+			} else {
+				//设置请求发送间隔时间
+				time.Sleep(time.Duration(task.timeDelay) * time.Millisecond)
+				task.tileWG.Add(1)
+				go task.tileFetcher(tile)
 			}
-			//设置请求发送间隔时间
-			time.Sleep(time.Duration(task.timeDelay) * time.Millisecond)
-			task.tileWG.Add(1)
-			go task.tileFetcher(tile)
 		case <-task.abort:
 			log.Infof("Task %s got canceled.", task.Name)
 		}
