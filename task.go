@@ -3,56 +3,78 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"database/sql"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/maptile"
 	"github.com/paulmach/orb/maptile/tilecover"
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
 	"github.com/teris-io/shortid"
 	pb "gopkg.in/cheggaaa/pb.v1"
 )
 
-//MBTileVersion mbtiles版本号
-const MBTileVersion = "1.2"
+func InitTask() {
+	start := time.Now()
 
-//Task 下载任务
-type Task struct {
-	ID                 string
-	Name               string
-	Description        string
-	File               string
-	Min                int
-	Max                int
-	Layers             []Layer
-	TileMap            TileMap
-	Total              int64
-	Current            int64
-	Bar                *pb.ProgressBar
-	db                 *sql.DB
-	workerCount        int
-	savePipeSize       int
-	timeDelay          int
-	bufSize            int
-	tileWG             sync.WaitGroup
-	abort, pause, play chan struct{}
-	workers            chan maptile.Tile
-	savingpipe         chan Tile
-	tileSet            Set
-	outformat          string
+	tm := TileMap{
+		Name:   conf.Tm.Name,
+		Min:    conf.Tm.Min,
+		Max:    conf.Tm.Max,
+		Format: conf.Tm.Format,
+		URL:    conf.Tm.URL,
+	}
+	var layers []Layer
+	for _, lrs := range conf.Lrs {
+		for z := lrs.Min; z <= lrs.Max; z++ {
+			c := loadCollection(lrs.Geojson)
+			layer := Layer{
+				URL:        conf.Tm.URL,
+				Zoom:       z,
+				Collection: c,
+			}
+			layers = append(layers, layer)
+		}
+	}
+
+	task := NewTask(layers, tm)
+	// 注册安全退出
+	SafeExitInst.Register(task.AbortFun)
+
+	// 开始下载
+	task.Download()
+
+	secs := time.Since(start).Seconds()
+	log.Printf("\n%.3fs finished...", secs)
 }
 
-//NewTask 创建下载任务
+// Task 下载任务
+type Task struct {
+	ID           string
+	Name         string
+	Description  string
+	File         string
+	Min          int
+	Max          int
+	Layers       []Layer
+	TileMap      TileMap
+	Total        int64
+	Current      int64
+	Bar          *pb.ProgressBar
+	workerCount  int
+	savePipeSize int
+	timeDelay    int
+	bufSize      int
+	tileWG       sync.WaitGroup
+	abort        chan struct{}
+	workers      chan struct{}
+	tileSet      Set
+}
+
+// NewTask 创建下载任务
 func NewTask(layers []Layer, m TileMap) *Task {
 	if len(layers) == 0 {
 		return nil
@@ -76,23 +98,20 @@ func NewTask(layers []Layer, m TileMap) *Task {
 		log.Printf("zoom: %d, tiles: %d \n", layers[i].Zoom, layers[i].Count)
 		task.Total += layers[i].Count
 	}
-	task.abort = make(chan struct{})
-	task.pause = make(chan struct{})
-	task.play = make(chan struct{})
 
-	task.workerCount = viper.GetInt("task.workers")
-	task.savePipeSize = viper.GetInt("task.savepipe")
-	task.timeDelay = viper.GetInt("task.timedelay")
-	task.workers = make(chan maptile.Tile, task.workerCount)
-	task.savingpipe = make(chan Tile, task.savePipeSize)
-	task.bufSize = viper.GetInt("task.mergebuf")
+	task.workerCount = conf.Task.Workers
+	task.savePipeSize = conf.Task.Savepipe
+	task.timeDelay = conf.Task.Timedelay
+	task.bufSize = conf.Task.BufSize
+
+	task.abort = make(chan struct{})
+	task.workers = make(chan struct{}, task.workerCount)
 	task.tileSet = Set{M: make(maptile.Set)}
 
-	task.outformat = viper.GetString("output.format")
 	return &task
 }
 
-//Bound 范围
+// Bound 范围
 func (task *Task) Bound() orb.Bound {
 	bound := orb.Bound{Min: orb.Point{1, 1}, Max: orb.Point{-1, -1}}
 	for _, layer := range task.Layers {
@@ -103,7 +122,7 @@ func (task *Task) Bound() orb.Bound {
 	return bound
 }
 
-//Center 中心点
+// Center 中心点
 func (task *Task) Center() orb.Point {
 	layer := task.Layers[len(task.Layers)-1]
 	bound := orb.Bound{Min: orb.Point{1, 1}, Max: orb.Point{-1, -1}}
@@ -113,148 +132,50 @@ func (task *Task) Center() orb.Point {
 	return bound.Center()
 }
 
-//MetaItems 输出
-func (task *Task) MetaItems() map[string]string {
-	b := task.Bound()
-	c := task.Center()
-	data := map[string]string{
-		"id":          task.ID,
-		"name":        task.Name,
-		"description": task.Description,
-		"attribution": `<a href="http://www.atlasdata.cn/" target="_blank">&copy; MapCloud</a>`,
-		"basename":    task.TileMap.Name,
-		"format":      task.TileMap.Format,
-		"type":        task.TileMap.Schema,
-		"pixel_scale": strconv.Itoa(TileSize),
-		"version":     MBTileVersion,
-		"bounds":      fmt.Sprintf(`%f,%f,%f,%f`, b.Left(), b.Bottom(), b.Right(), b.Top()),
-		"center":      fmt.Sprintf(`%f,%f,%d`, c.X(), c.Y(), (task.Min+task.Max)/2),
-		"minzoom":     strconv.Itoa(task.Min),
-		"maxzoom":     strconv.Itoa(task.Max),
-		"json":        task.TileMap.JSON,
-	}
-	return data
-}
-
-//SetupMBTileTables 初始化配置MBTile库
-func (task *Task) SetupMBTileTables() error {
-
+func (task *Task) SetupFile() error {
 	if task.File == "" {
-		outdir := viper.GetString("output.directory")
+		outdir := conf.Output.Directory
 		os.MkdirAll(outdir, os.ModePerm)
-		task.File = filepath.Join(outdir, fmt.Sprintf("%s-z%d-%d.%s.mbtiles", task.Name, task.Min, task.Max, task.ID))
+		task.File = outdir
 	}
-	os.Remove(task.File)
-	db, err := sql.Open("sqlite3", task.File)
-	if err != nil {
-		return err
-	}
-
-	err = optimizeConnection(db)
-	if err != nil {
-		return err
-	}
-
-	_, err = db.Exec("create table if not exists tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);")
-	if err != nil {
-		return err
-	}
-
-	_, err = db.Exec("create table if not exists metadata (name text, value text);")
-	if err != nil {
-		return err
-	}
-
-	_, err = db.Exec("create unique index name on metadata (name);")
-	if err != nil {
-		return err
-	}
-
-	_, err = db.Exec("create unique index tile_index on tiles(zoom_level, tile_column, tile_row);")
-	if err != nil {
-		return err
-	}
-
-	// Load metadata.
-	for name, value := range task.MetaItems() {
-		_, err := db.Exec("insert into metadata (name, value) values (?, ?)", name, value)
-		if err != nil {
-			return err
-		}
-	}
-
-	task.db = db //保存任务的库连接
 	return nil
 }
 
-func (task *Task) abortFun() {
-	// os.Stdin.Read(make([]byte, 1)) // read a single byte
-	// <-time.After(8 * time.Second)
+// 结束任务
+func (task *Task) AbortFun() {
 	task.abort <- struct{}{}
 }
 
-func (task *Task) pauseFun() {
-	// os.Stdin.Read(make([]byte, 1)) // read a single byte
-	// <-time.After(3 * time.Second)
-	task.pause <- struct{}{}
-}
-
-func (task *Task) playFun() {
-	// os.Stdin.Read(make([]byte, 1)) // read a single byte
-	// <-time.After(5 * time.Second)
-	task.play <- struct{}{}
-}
-
-//SavePipe 保存瓦片管道
-func (task *Task) savePipe() {
-	for tile := range task.savingpipe {
-		err := saveToMBTile(tile, task.db)
-		if err != nil {
-			if strings.HasPrefix(err.Error(), "UNIQUE constraint failed") {
-				log.Warnf("save %v tile to mbtiles db error ~ %s", tile.T, err)
-			} else {
-				log.Errorf("save %v tile to mbtiles db error ~ %s", tile.T, err)
-			}
-		}
+// Download 开启下载任务
+func (task *Task) Download() {
+	task.SetupFile()
+	for _, layer := range task.Layers {
+		task.downloadLayer(layer)
 	}
 }
 
-//SaveTile 保存瓦片
-func (task *Task) saveTile(tile Tile) error {
-	// defer task.wg.Done()
-	err := saveToFiles(tile, task)
-	if err != nil {
-		log.Errorf("create %v tile file error ~ %s", tile.T, err)
-	}
-	return nil
-}
-
-//tileFetcher 瓦片加载器
-func (task *Task) tileFetcher(mt maptile.Tile, url string) {
+// tileFetcher 瓦片加载器
+func (task *Task) tileFetcher(mt maptile.Tile) {
 	start := time.Now()
-	defer task.tileWG.Done() //结束该瓦片请求
+	//workers完成并清退
 	defer func() {
-		<-task.workers //workers完成并清退
+		task.tileWG.Done()
+		<-task.workers
 	}()
 
-	prep := func(t maptile.Tile, url string) string {
-		url = strings.Replace(url, "{x}", strconv.Itoa(int(t.X)), -1)
-		url = strings.Replace(url, "{y}", strconv.Itoa(int(t.Y)), -1)
-		url = strings.Replace(url, "{z}", strconv.Itoa(int(t.Z)), -1)
-		return url
-	}
-	tile := prep(mt, url)
-	resp, err := http.Get(tile)
+	// 获取请求地址
+	url := task.TileMap.GetTileURL(mt)
+	resp, err := http.Get(url)
 	if err != nil {
-		log.Errorf("fetch :%s error, details: %s ~", tile, err)
+		log.Errorf("fetch :%s error, details: %s ~", url, err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Errorf("fetch %v tile error, status code: %d ~", tile, resp.StatusCode)
+		log.Errorf("fetch %v tile error, status code: %d ~", url, resp.StatusCode)
 		return
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Errorf("read %v tile error ~ %s", mt, err)
 		return
@@ -282,71 +203,65 @@ func (task *Task) tileFetcher(mt maptile.Tile, url string) {
 		td.C = buf.Bytes()
 	}
 
-	//enable savingpipe
-	if task.outformat == "mbtiles" {
-		task.savingpipe <- td
-	} else {
-		// task.wg.Add(1)
-		task.saveTile(td)
-	}
+	// enable savingpipe
+	task.saveTile(td)
+	BreakPointInst.SetSuccessed(mt)
 
 	cost := time.Since(start).Milliseconds()
-	log.Infof("tile(z:%d, x:%d, y:%d), %dms , %.2f kb, %s ...\n", mt.Z, mt.X, mt.Y, cost, float32(len(body))/1024.0, tile)
+	log.Debugf("tile(z:%d, x:%d, y:%d), %dms , %.2f kb, %s ...\n", mt.Z, mt.X, mt.Y, cost, float32(len(body))/1024.0, url)
 }
 
-//DownloadZoom 下载指定层级
+// SaveTile 保存瓦片
+func (task *Task) saveTile(tile Tile) error {
+	// defer task.wg.Done()
+	err := saveToFiles(tile, task)
+	if err != nil {
+		log.Errorf("create %v tile file error ~ %s", tile.T, err)
+	}
+	return nil
+}
+
+// DownloadZoom 下载指定层级
 func (task *Task) downloadLayer(layer Layer) {
+	log.Infof("Task layer: %s starting", layer)
 	bar := pb.New64(layer.Count).Prefix(fmt.Sprintf("Zoom %d : ", layer.Zoom)).Postfix("\n")
-	// bar.SetRefreshRate(time.Second)
+	bar.SetRefreshRate(time.Second)
 	bar.Start()
-	// bar.SetMaxWidth(300)
 
 	var tilelist = make(chan maptile.Tile, task.bufSize)
 
 	go tilecover.CollectionChannel(layer.Collection, maptile.Zoom(layer.Zoom), tilelist)
 
 	for tile := range tilelist {
-		// log.Infof(`fetching tile %v ~`, tile)
+		// 任务从设置的开始点启动
+		if task.checkStart() {
+			continue
+		}
 		select {
-		case task.workers <- tile:
+		// 向队列发送数据
+		case task.workers <- struct{}{}:
+			bar.Increment()
+			// 如果已经在成功列表里
+			if BreakPointInst.IsSuccessed(tile) {
+				log.Infoln("芜湖，该文件已下载，跳过")
+				continue
+			}
 			//设置请求发送间隔时间
 			time.Sleep(time.Duration(task.timeDelay) * time.Millisecond)
-			bar.Increment()
-			task.Bar.Increment()
 			task.tileWG.Add(1)
-			go task.tileFetcher(tile, layer.URL)
+			go task.tileFetcher(tile)
 		case <-task.abort:
-			log.Infof("Task %s got canceled.", task.ID)
-			close(tilelist)
-		case <-task.pause:
-			log.Infof("Task %s suspended.", task.ID)
-			select {
-			case <-task.play:
-				log.Infof("Task %s go on.", task.ID)
-			case <-task.abort:
-				log.Infof("Task %s got canceled.", task.ID)
-				close(tilelist)
-			}
+			log.Infof("Task %s got canceled.", task.Name)
+		default:
+			log.Debugln("wait works...")
 		}
 	}
 	//等待该层结束
 	task.tileWG.Wait()
 	bar.FinishPrint(fmt.Sprintf("Task %s Zoom %d finished ~", task.ID, layer.Zoom))
+
 }
 
-//Download 开启下载任务
-func (task *Task) Download() {
-	//g orb.Geometry, minz int, maxz int
-	task.Bar = pb.New64(task.Total).Prefix("Task : ").Postfix("\n")
-	// task.Bar.SetRefreshRate(10 * time.Second)
-	// task.Bar.Format("<.- >")
-	task.Bar.Start()
-	if task.outformat == "mbtiles" {
-		task.SetupMBTileTables()
-	}
-	go task.savePipe()
-	for _, layer := range task.Layers {
-		task.downloadLayer(layer)
-	}
-	task.Bar.FinishPrint(fmt.Sprintf("Task %s finished ~", task.ID))
+func (task *Task) checkStart() bool {
+	return false
 }

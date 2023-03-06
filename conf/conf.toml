@@ -1,0 +1,40 @@
+[app]
+title = "MapCloud Tiler"
+version = "v 0.2.0"
+
+[output]
+directory = "data"
+logDir = "log"
+outputTerminal = true
+
+
+# 断点
+[breakPoint]
+# real file name ./tmp/{tm.name}.log
+saveFilePath = "tmp"
+
+[task]
+#number of fetchers
+workers = 80
+#number of savers
+savepipe = 10
+#min request interval, a speed limit, unit millisecond
+timedelay = 2
+#任务缓存
+bufSize = 10
+
+[tm]
+#name for mbtiles
+name = "google satelite"
+#max and min level for mbtiles
+max = 11
+min = 0
+#can be pbf/png/jpg
+format = "png"
+# 请求 url
+url = "https://gac-geo.googlecnapps.cn/maps/vt?lyrs=s&x={x}&y={y}&z={z}"
+
+[[lrs]]
+geojson = "./geojson/china.geojson"
+max = 18
+min = 17
