@@ -43,7 +43,7 @@ func (s *SafeExit) ListenSignal() {
 	for singal := range sigs {
 		switch singal {
 		case syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
-			fmt.Println("正在停止任务，请稍后")
+			fmt.Printf("收到系统信号 %d, 正在停止任务, 请稍后", singal)
 			s.exit()
 		}
 	}
